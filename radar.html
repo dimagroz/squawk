@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Squawk // Radar Replay</title>
+<style>
+  :root {
+    --bg: #090b0c; --panel: #111417; --fill: #181b20; --border: #2b303b;
+    --text: #c2c9d6; --muted: #737d8c; --max: #fefffe;
+    --scope: #7dd3e8; --ink: #ccff00; --danger: #f2654c; --warn: #f2b84c;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 13px/1.5 var(--mono); }
+  body { display: grid; grid-template-columns: minmax(0, 1fr) 340px; }
+  #scope { width: 100%; height: 100vh; display: block; cursor: grab; }
+  #scope:active { cursor: grabbing; }
+  aside { border-left: 1px solid var(--border); background: var(--panel); height: 100vh; overflow-y: auto;
+          display: flex; flex-direction: column; }
+  section { padding: 14px 16px; border-bottom: 1px solid var(--border); display: grid; gap: 8px; }
+  h1 { margin: 0; font-size: 13px; letter-spacing: .22em; color: var(--max); font-weight: 500; }
+  h2 { margin: 0; font-size: 11px; letter-spacing: .12em; color: var(--muted); font-weight: 500; text-transform: uppercase; }
+  .clock { font-size: 28px; color: var(--max); letter-spacing: .04em; }
+  .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  button, select { background: var(--fill); color: var(--max); border: 1px solid var(--border); font: inherit;
+                   padding: 4px 10px; cursor: pointer; }
+  button:hover, select:hover { border-color: var(--muted); }
+  button.on { background: var(--ink); color: #1e2229; border-color: var(--ink); }
+  input[type=range] { width: 100%; accent-color: var(--ink); }
+  #readback { width: 100%; height: 92px; background: var(--bg); border: 1px solid var(--border); display: block; }
+  .emer { border-left: 3px solid var(--danger); padding-left: 10px; }
+  .emer b { color: var(--danger); font-weight: 500; }
+  .kv { display: grid; grid-template-columns: 70px 1fr; gap: 0 8px; }
+  .kv span:nth-child(odd) { color: var(--muted); }
+  #status { color: var(--ink); }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  td { padding: 2px 4px 2px 0; white-space: nowrap; }
+  tr { cursor: pointer; }
+  tr:hover td { color: var(--max); }
+  tr.sel td { color: var(--ink); }
+  tr.e7700 td { color: var(--danger); }
+  .hint { color: var(--muted); font-size: 11px; }
+</style>
+</head>
+<body>
+<canvas id="scope"></canvas>
+<aside>
+  <section>
+    <h1>SQUAWK // RADAR REPLAY</h1>
+    <div class="clock" id="clock">--:--:--Z</div>
+    <div class="row">
+      <button id="play">Pause</button>
+      <select id="speed">
+        <option value="15">15x</option><option value="30">30x</option><option value="60" selected>60x</option>
+        <option value="120">120x</option><option value="300">300x</option>
+      </select>
+      <button id="ink" class="on">Ink</button>
+      <button id="trails" class="on">Trails</button>
+    </div>
+    <input type="range" id="scrub" min="0" max="1" step="1" value="0">
+    <div class="row">
+      <button id="jump">Jump to 7700</button>
+      <button id="zoom">Zoom skywriting</button>
+      <button id="fit">Fit all</button>
+    </div>
+    <div class="hint">Space: play/pause, wheel: zoom, drag: pan, click a tag or row to select.</div>
+  </section>
+  <section>
+    <h2>Readback</h2>
+    <canvas id="readback"></canvas>
+    <div class="emer" id="emer"></div>
+  </section>
+  <section>
+    <h2>On frequency (<span id="count">0</span>)</h2>
+    <table><tbody id="list"></tbody></table>
+  </section>
+</aside>
+<script src="data/radar-data.js"></script>
+<script>
+(() => {
+  const D = window.SQUAWK;
+  if (!D) { document.body.innerHTML = '<p style="padding:20px">Run solve.ps1 first to generate data/radar-data.js</p>'; return; }
+
+  const AIRPORTS = {
+    KMIA: [25.7959, -80.2870], KFLL: [26.0726, -80.1527], KPBI: [26.6832, -80.0956],
+    MYNN: [25.0390, -77.4662], MYGF: [26.5587, -78.6956], MYAM: [26.5114, -77.0836],
+    MYEH: [25.4749, -76.6835], MYEF: [23.5626, -75.8780], MYAF: [24.6979, -77.7956], MYER: [24.8917, -76.1769],
+  };
+  const [lat0, lon0] = D.center;
+  const kx = 60 * Math.cos(lat0 * Math.PI / 180);
+  const toNm = (lat, lon) => [(lon - lon0) * kx, (lat - lat0) * 60];
+
+  // p = [t, lat, lon, alt, squawk, gs, pen?, letter?]
+  let tMax = 0;
+  const planes = D.aircraft.map(a => {
+    const pts = a.p.map((p, i) => ({ i, t: p[0], xy: toNm(p[1], p[2]), alt: p[3], sq: p[4], gs: p[5], pen: p[6], letter: p[7] }));
+    tMax = Math.max(tMax, pts[pts.length - 1].t);
+    return { ...a, pts, emergency: a.hex === D.emergency };
+  });
+  const em = planes.find(p => p.emergency);
+  const emStart = em.pts.find(p => p.sq === '7700').t;
+
+  function stateAt(pl, t) {
+    const p = pl.pts;
+    if (t < p[0].t || t > p[p.length - 1].t + 20) return null;
+    let lo = 0, hi = p.length - 1;
+    while (lo < hi) { const m = (lo + hi + 1) >> 1; if (p[m].t <= t) lo = m; else hi = m - 1; }
+    const a = p[lo], b = p[Math.min(lo + 1, p.length - 1)];
+    if (b.t - a.t > 90 || b === a) return t - a.t < 30 ? { ...a, i: lo, hdg: hdgOf(p, lo) } : null;
+    const f = (t - a.t) / (b.t - a.t);
+    return { ...a, i: lo, xy: [a.xy[0] + (b.xy[0] - a.xy[0]) * f, a.xy[1] + (b.xy[1] - a.xy[1]) * f],
+             alt: a.alt + (b.alt - a.alt) * f, hdg: hdgOf(p, lo) };
+  }
+  function hdgOf(p, i) {
+    const a = p[Math.max(0, i - 1)], b = p[Math.min(p.length - 1, i + 1)];
+    return Math.atan2(b.xy[0] - a.xy[0], b.xy[1] - a.xy[1]);
+  }
+
+  // ------------------------------------------------------------- view
+  const cv = document.getElementById('scope'), ctx = cv.getContext('2d');
+  const view = { x: 0, y: 0, s: 2 };
+  let W = 0, H = 0, dpr = 1;
+  function resize() {
+    dpr = window.devicePixelRatio || 1;
+    W = cv.clientWidth; H = cv.clientHeight;
+    cv.width = W * dpr; cv.height = H * dpr;
+  }
+  const sx = x => W / 2 + (x - view.x) * view.s;
+  const sy = y => H / 2 - (y - view.y) * view.s;
+  function fitTo(pts, pad = 1.15) {
+    const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+    const [x0, x1, y0, y1] = [Math.min(...xs), Math.max(...xs), Math.min(...ys), Math.max(...ys)];
+    view.x = (x0 + x1) / 2; view.y = (y0 + y1) / 2;
+    view.s = Math.min(W / ((x1 - x0) * pad || 1), H / ((y1 - y0) * pad || 1));
+  }
+  const allXY = planes.flatMap(p => p.pts.filter((_, i) => i % 10 === 0).map(q => q.xy));
+  const skyXY = em.pts.filter(p => p.letter >= 0).map(p => p.xy);
+
+  // ------------------------------------------------------------- readback inset
+  const rb = document.getElementById('readback'), rctx = rb.getContext('2d');
+  const th = D.rotation * Math.PI / 180;
+  const rot = ([x, y]) => [x * Math.cos(th) + y * Math.sin(th), -x * Math.sin(th) + y * Math.cos(th)];
+  const glyphs = [];
+  for (let L = 0; L < D.letters; L++) {
+    const pts = em.pts.filter(p => p.letter === L).map(p => ({ ...p, r: rot(p.xy) }));
+    const xs = pts.map(p => p.r[0]), ys = pts.map(p => p.r[1]);
+    glyphs.push({ pts, cx: (Math.min(...xs) + Math.max(...xs)) / 2, cy: (Math.min(...ys) + Math.max(...ys)) / 2,
+                  w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys) });
+  }
+
+  function drawReadback(t) {
+    const w = rb.clientWidth, h = rb.clientHeight;
+    rb.width = w * dpr; rb.height = h * dpr; rctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    rctx.clearRect(0, 0, w, h);
+    const slot = w / D.letters;
+    const size = Math.max(...glyphs.map(g => Math.max(g.w, g.h)));
+    const k = Math.min(slot * 0.7, h * 0.72) / size;
+    rctx.lineCap = rctx.lineJoin = 'round';
+    glyphs.forEach((g, L) => {
+      const ox = slot * (L + 0.5), oy = h / 2;
+      rctx.strokeStyle = '#1e2229'; rctx.lineWidth = 1;
+      rctx.strokeRect(slot * L + 4, 4, slot - 8, h - 8);
+      rctx.strokeStyle = getCss('--ink'); rctx.lineWidth = 3.5;
+      rctx.beginPath();
+      for (let i = 1; i < g.pts.length; i++) {
+        const a = g.pts[i - 1], b = g.pts[i];
+        if (b.t > t) break;
+        if (!(a.pen && b.pen) || b.i !== a.i + 1) continue;
+        rctx.moveTo(ox + (a.r[0] - g.cx) * k, oy - (a.r[1] - g.cy) * k);
+        rctx.lineTo(ox + (b.r[0] - g.cx) * k, oy - (b.r[1] - g.cy) * k);
+      }
+      rctx.stroke();
+      const cur = g.pts.length && t >= g.pts[0].t && t <= g.pts[g.pts.length - 1].t ? stateAt(em, t) : null;
+      if (cur) {
+        const r = rot(cur.xy);
+        rctx.fillStyle = cur.pen ? getCss('--ink') : getCss('--muted');
+        rctx.beginPath(); rctx.arc(ox + (r[0] - g.cx) * k, oy - (r[1] - g.cy) * k, 4, 0, Math.PI * 2); rctx.fill();
+      }
+    });
+  }
+
+  // ------------------------------------------------------------- scope
+  const cssCache = {};
+  const getCss = n => cssCache[n] || (cssCache[n] = getComputedStyle(document.documentElement).getPropertyValue(n).trim());
+  const ui = { playing: true, speed: 60, ink: true, trails: true, selected: em.hex };
+  let simT = 0, lastFrame = performance.now(), tags = [];
+
+  function drawScope(t, now) {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = getCss('--bg'); ctx.fillRect(0, 0, W, H);
+    const cx = sx(0), cy = sy(0);
+    const R = Math.hypot(W, H);
+
+    // range rings, every 25 nm, labelled every 50
+    ctx.strokeStyle = 'rgba(125,211,232,.10)'; ctx.fillStyle = 'rgba(125,211,232,.35)'; ctx.lineWidth = 1;
+    ctx.font = '10px ' + getCss('--mono');
+    for (let nm = 25; nm * view.s < R; nm += 25) {
+      ctx.beginPath(); ctx.arc(cx, cy, nm * view.s, 0, Math.PI * 2); ctx.stroke();
+      if (nm % 50 === 0) ctx.fillText(nm + 'NM', cx + 4, cy - nm * view.s - 3);
+    }
+    for (let deg = 0; deg < 360; deg += 30) {
+      const a = deg * Math.PI / 180;
+      ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + Math.sin(a) * R, cy - Math.cos(a) * R); ctx.stroke();
+    }
+
+    // sweep: one revolution every 4 real seconds
+    const sweep = (now / 4000 * Math.PI * 2) % (Math.PI * 2);
+    if (ctx.createConicGradient) {
+      const g = ctx.createConicGradient(sweep - Math.PI / 2 - 0.9, cx, cy);
+      g.addColorStop(0, 'rgba(125,211,232,0)');
+      g.addColorStop(0.14, 'rgba(125,211,232,.10)');
+      g.addColorStop(0.1433, 'rgba(125,211,232,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.moveTo(cx, cy); ctx.arc(cx, cy, R, sweep - Math.PI / 2 - 0.9, sweep - Math.PI / 2); ctx.fill();
+    }
+    ctx.strokeStyle = 'rgba(125,211,232,.45)';
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + Math.sin(sweep) * R, cy - Math.cos(sweep) * R); ctx.stroke();
+
+    // airports
+    ctx.font = '10px ' + getCss('--mono');
+    for (const [id, [la, lo]] of Object.entries(AIRPORTS)) {
+      const [x, y] = toNm(la, lo), px = sx(x), py = sy(y);
+      ctx.strokeStyle = 'rgba(148,158,174,.6)'; ctx.strokeRect(px - 3, py - 3, 6, 6);
+      ctx.fillStyle = 'rgba(148,158,174,.7)'; ctx.fillText(id, px + 6, py + 3);
+    }
+
+    // skywriting ink
+    if (ui.ink) {
+      ctx.lineCap = ctx.lineJoin = 'round';
+      let current = -1;
+      for (const p of em.pts) { if (p.t > t) break; if (p.letter >= 0) current = p.letter; }
+      // letters are written on top of each other, so older ones fade back
+      const paths = { downFresh: new Path2D(), downOld: new Path2D(), upFresh: new Path2D(), upOld: new Path2D() };
+      for (let i = 1; i < em.pts.length; i++) {
+        const a = em.pts[i - 1], b = em.pts[i];
+        if (b.t > t) break;
+        if (b.letter === undefined || a.letter === undefined) continue;
+        const fresh = b.letter === current || (b.letter < 0 && t - b.t < 600);
+        const path = paths[(a.pen && b.pen ? 'down' : 'up') + (fresh ? 'Fresh' : 'Old')];
+        path.moveTo(sx(a.xy[0]), sy(a.xy[1])); path.lineTo(sx(b.xy[0]), sy(b.xy[1]));
+      }
+      const inkW = Math.min(8, Math.max(2, view.s * 0.4));
+      ctx.setLineDash([3, 4]); ctx.lineWidth = 1;
+      ctx.strokeStyle = 'rgba(115,125,140,.1)'; ctx.stroke(paths.upOld);
+      ctx.strokeStyle = 'rgba(115,125,140,.45)'; ctx.stroke(paths.upFresh);
+      ctx.setLineDash([]); ctx.lineWidth = inkW;
+      ctx.strokeStyle = 'rgba(204,255,0,.12)'; ctx.stroke(paths.downOld);
+      ctx.strokeStyle = 'rgba(204,255,0,.9)'; ctx.stroke(paths.downFresh);
+    }
+
+    // aircraft
+    tags = [];
+    const blink = Math.floor(now / 400) % 2 === 0;
+    for (const pl of planes) {
+      const s = stateAt(pl, t);
+      if (!s) continue;
+      const is7700 = s.sq === '7700', is7600 = s.sq === '7600';
+      const sel = pl.hex === ui.selected;
+      const color = is7700 ? getCss('--danger') : is7600 ? getCss('--warn') : sel ? getCss('--ink') : getCss('--scope');
+      const px = sx(s.xy[0]), py = sy(s.xy[1]);
+
+      // phosphor: brightest right after the sweep passes
+      const bearing = (Math.atan2(s.xy[0], s.xy[1]) + Math.PI * 2) % (Math.PI * 2);
+      const since = (sweep - bearing + Math.PI * 4) % (Math.PI * 2);
+      const glow = 0.45 + 0.55 * Math.exp(-since * 1.2);
+
+      if (ui.trails) {
+        ctx.fillStyle = color;
+        for (let i = s.i, n = 0; i >= 0 && n < 14; i -= 2, n++) {
+          const q = pl.pts[i];
+          if (t - q.t > 420) break;
+          ctx.globalAlpha = glow * (1 - n / 14) * 0.6;
+          ctx.fillRect(sx(q.xy[0]) - 1, sy(q.xy[1]) - 1, 2, 2);
+        }
+      }
+      ctx.globalAlpha = glow;
+      ctx.strokeStyle = color; ctx.fillStyle = color;
+      ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(px + Math.sin(s.hdg) * 18, py - Math.cos(s.hdg) * 18); ctx.stroke();
+      ctx.fillRect(px - 3, py - 3, 6, 6);
+      if (is7700 && blink) { ctx.beginPath(); ctx.arc(px, py, 10, 0, Math.PI * 2); ctx.stroke(); }
+
+      const lx = px + 14, ly = py - 22;
+      ctx.globalAlpha = Math.max(glow, sel ? 1 : 0.8);
+      ctx.beginPath(); ctx.moveTo(px + 4, py - 4); ctx.lineTo(lx - 2, ly + 10); ctx.stroke();
+      ctx.font = '11px ' + getCss('--mono');
+      const fl = String(Math.round(s.alt / 100)).padStart(3, '0');
+      ctx.fillText(pl.cs || pl.hex.toUpperCase(), lx, ly);
+      ctx.fillText(`${fl} ${String(Math.round(s.gs)).padStart(3, ' ')}`, lx, ly + 12);
+      ctx.fillText(is7700 && blink ? 'EMRG' : s.sq, lx, ly + 24);
+      ctx.globalAlpha = 1;
+      tags.push({ hex: pl.hex, x0: px - 8, y0: ly - 12, x1: lx + 70, y1: py + 8 });
+    }
+
+    // HUD
+    ctx.fillStyle = 'rgba(194,201,214,.7)'; ctx.font = '11px ' + getCss('--mono');
+    ctx.fillText(`${ui.speed}x  ${ui.playing ? 'PLAY' : 'HOLD'}  ${(1 / view.s * 100).toFixed(1)} NM / 100 PX`, 14, H - 14);
+  }
+
+  // ------------------------------------------------------------- sidebar
+  const $ = id => document.getElementById(id);
+  const fmt = t => new Date((D.t0 + t) * 1000).toISOString().substr(11, 8) + 'Z';
+  let lastList = 0;
+  function updateSide(t) {
+    $('clock').textContent = fmt(t);
+    $('scrub').value = Math.round(t);
+    const s = stateAt(em, t);
+    const phase = !s ? 'off scope'
+      : s.sq !== '7700' ? `squawk ${s.sq}, inbound`
+      : s.letter === undefined ? 'squawking 7700'
+      : s.pen ? `PEN DOWN, letter ${s.letter + 1}` : 'repositioning (climb ~1300 ft)';
+    $('emer').innerHTML = `<b>${em.cs} 7700</b> ${em.type} ${em.from}-${em.to}
+      <div class="kv"><span>status</span><span id="status">${phase}</span>
+      <span>alt</span><span>${s ? Math.round(s.alt) + ' ft' : '-'}</span>
+      <span>gs</span><span>${s ? s.gs + ' kt' : '-'}</span></div>`;
+    if (performance.now() - lastList < 300) return;
+    lastList = performance.now();
+    const rows = planes.map(pl => ({ pl, s: stateAt(pl, t) })).filter(r => r.s)
+      .sort((a, b) => (b.s.sq === '7700') - (a.s.sq === '7700') || (a.pl.cs || a.pl.hex).localeCompare(b.pl.cs || b.pl.hex));
+    $('count').textContent = rows.length;
+    $('list').innerHTML = rows.map(({ pl, s }) =>
+      `<tr data-hex="${pl.hex}" class="${s.sq === '7700' ? 'e7700' : ''} ${pl.hex === ui.selected ? 'sel' : ''}">
+        <td>${pl.cs || pl.hex}</td><td>${s.sq}</td><td>FL${String(Math.round(s.alt / 100)).padStart(3, '0')}</td>
+        <td>${pl.from || '----'}-${pl.to || '----'}</td></tr>`).join('');
+  }
+
+  // ------------------------------------------------------------- input
+  $('scrub').max = Math.ceil(tMax);
+  $('scrub').oninput = e => { simT = +e.target.value; };
+  $('play').onclick = () => { ui.playing = !ui.playing; $('play').textContent = ui.playing ? 'Pause' : 'Play'; };
+  $('speed').onchange = e => { ui.speed = +e.target.value; };
+  $('ink').onclick = () => { ui.ink = !ui.ink; $('ink').classList.toggle('on', ui.ink); };
+  $('trails').onclick = () => { ui.trails = !ui.trails; $('trails').classList.toggle('on', ui.trails); };
+  $('jump').onclick = () => { simT = emStart - 60; ui.selected = em.hex; };
+  $('zoom').onclick = () => fitTo(skyXY, 1.6);
+  $('fit').onclick = () => fitTo(allXY);
+  $('list').onclick = e => { const tr = e.target.closest('tr'); if (tr) ui.selected = tr.dataset.hex; };
+  document.addEventListener('keydown', e => { if (e.code === 'Space') { e.preventDefault(); $('play').click(); } });
+
+  let drag = null;
+  cv.addEventListener('mousedown', e => { drag = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y, moved: false }; });
+  window.addEventListener('mousemove', e => {
+    if (!drag) return;
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
+    view.x = drag.vx - dx / view.s; view.y = drag.vy + dy / view.s;
+  });
+  window.addEventListener('mouseup', e => {
+    if (drag && !drag.moved) {
+      const r = cv.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
+      const hit = tags.find(g => x >= g.x0 && x <= g.x1 && y >= g.y0 && y <= g.y1);
+      if (hit) ui.selected = hit.hex;
+    }
+    drag = null;
+  });
+  cv.addEventListener('wheel', e => {
+    e.preventDefault();
+    const r = cv.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
+    const wx = view.x + (mx - W / 2) / view.s, wy = view.y - (my - H / 2) / view.s;
+    view.s *= Math.exp(-e.deltaY * 0.0015);
+    view.x = wx - (mx - W / 2) / view.s; view.y = wy + (my - H / 2) / view.s;
+  }, { passive: false });
+  window.addEventListener('resize', resize);
+
+  // ------------------------------------------------------------- loop
+  function frame(now) {
+    const dt = Math.min(0.1, (now - lastFrame) / 1000);
+    lastFrame = now;
+    if (ui.playing) { simT += dt * ui.speed; if (simT > tMax) simT = 0; }
+    drawScope(simT, now);
+    drawReadback(simT);
+    updateSide(simT);
+    requestAnimationFrame(frame);
+  }
+  resize();
+  fitTo(allXY);
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
